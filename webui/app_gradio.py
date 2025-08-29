@@ -304,7 +304,7 @@ def chat_stream_tts_realtime(
             # yield current audio with updated transcript
             if stop_evt.is_set():
                 break
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc, ""
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
 
     # Final flush: one more decode attempt
     if token_buf is not None:
@@ -340,6 +340,9 @@ def chat_stream_entry(
     sentence_aware_stream: bool = False,
     cancel_evt: Optional[threading.Event] = None,
     chat_history: Optional[list] = None,
+    clone_enabled: bool = False,
+    clone_ref_audio=None,
+    clone_ref_text: str = "",
 ):
     if llm_provider == "Mock":
         yield from chat_stream_mock(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
@@ -357,6 +360,9 @@ def chat_stream_entry(
             bool(sentence_aware_stream),
             cancel_evt,
             chat_history,
+            clone_enabled,
+            clone_ref_audio,
+            clone_ref_text,
         )
     else:
         # Placeholder before LLM integration
@@ -513,6 +519,24 @@ def _pop_sentence(buf: str, min_len: int = 12) -> tuple[str, str]:
     return sent, rem
 
 
+def _extract_audio_b64(reference_audio) -> str:
+    """Extract base64 from a Gradio File-like input."""
+    if reference_audio is None:
+        return ""
+    if isinstance(reference_audio, dict) and "path" in reference_audio:
+        file_path = reference_audio["path"]
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read()
+    elif isinstance(reference_audio, str):
+        with open(reference_audio, "rb") as f:
+            raw_bytes = f.read()
+    elif hasattr(reference_audio, "read"):
+        raw_bytes = reference_audio.read()
+    else:
+        return ""
+    return base64.b64encode(raw_bytes).decode("utf-8")
+
+
 def chat_stream_ollama_incremental_tts(
     user_text: str,
     ollama_model: str,
@@ -524,6 +548,9 @@ def chat_stream_ollama_incremental_tts(
     sentence_aware_stream: bool = False,
     cancel_evt: Optional[threading.Event] = None,
     chat_history: Optional[list] = None,
+    clone_enabled: bool = False,
+    clone_ref_audio=None,
+    clone_ref_text: str = "",
 ):
     """Stream text from Ollama and synthesize audio per segment incrementally."""
     if not user_text.strip():
@@ -534,8 +561,8 @@ def chat_stream_ollama_incremental_tts(
     engine = _lazy_init()
     sr = engine.audio_tokenizer.sampling_rate
 
-    # Prime Audio and live sink (empty)
-    yield (sr, np.array([1e-6], dtype=np.float32)), "", ""
+    # Prime Audio
+    yield (sr, np.array([1e-6], dtype=np.float32)), ""
 
     transcript_acc = ""
     buf = ""
@@ -545,6 +572,8 @@ def chat_stream_ollama_incremental_tts(
         x = np.asarray(arr, dtype=np.float32).tobytes()
         return base64.b64encode(x).decode("ascii")
 
+    b64_ref = _extract_audio_b64(clone_ref_audio) if clone_enabled else ""
+
     def synth_and_stream(segment_text: str):
         nonlocal acc_pcm
         st = segment_text.strip()
@@ -552,11 +581,18 @@ def chat_stream_ollama_incremental_tts(
 
         # In sentence-aware mode, use non-streaming generation for Smart Voice parity
         if sentence_aware_stream:
-            system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
-            messages = [
-                Message(role="system", content=system_prompt),
-                Message(role="user", content=st),
-            ]
+            if clone_enabled and b64_ref and clone_ref_text.strip():
+                messages = [
+                    Message(role="user", content=clone_ref_text.strip()),
+                    Message(role="assistant", content=AudioContent(raw_audio=b64_ref, audio_url="placeholder")),
+                    Message(role="user", content=st),
+                ]
+            else:
+                system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+                messages = [
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=st),
+                ]
             chat_ml = ChatMLSample(messages=messages)
             sr_seg, audio_seg = _run_generate(
                 chat_ml,
@@ -570,9 +606,7 @@ def chat_stream_ollama_incremental_tts(
                 acc_pcm = _crossfade_concat(acc_pcm, audio_seg.astype(np.float32), sr_seg, 0)
                 safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                 if cancel_evt is None or not cancel_evt.is_set():
-                    # Send live chunk to WebAudio sink as base64 Float32 JSON {sr,b64}
-                    payload = json.dumps({"sr": int(sr_seg), "b64": _pcm_to_b64(audio_seg.astype(np.float32))})
-                    yield (sr_seg, safe_audio), transcript_acc, payload
+                    yield (sr_seg, safe_audio), transcript_acc
             return
 
         # Fallback: original delta-stream path for non-sentence-aware mode
@@ -623,7 +657,7 @@ def chat_stream_ollama_incremental_tts(
                             acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, seg_overlap_ms)
                             safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                             if cancel_evt is None or not cancel_evt.is_set():
-                                yield (sr, safe_audio), transcript_acc, ""
+                                yield (sr, safe_audio), transcript_acc
                         last_decoded_len = pcm.shape[0]
                     except Exception:
                         pass
@@ -641,7 +675,7 @@ def chat_stream_ollama_incremental_tts(
                         acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, overlap_ms)
                         safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                         if cancel_evt is None or not cancel_evt.is_set():
-                            yield (sr, safe_audio), transcript_acc, ""
+                            yield (sr, safe_audio), transcript_acc
             except Exception:
                 pass
 
@@ -655,17 +689,24 @@ def chat_stream_ollama_incremental_tts(
             if cancel_evt is not None and cancel_evt.is_set():
                 break
             full_text += chunk
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), full_text, ""
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), full_text
         if cancel_evt is None or not cancel_evt.is_set():
             final_text = full_text.strip()
             if final_text:
                 print(f"[OllamaTTS:Full] Synthesizing full response (len={len(final_text)}). Using _run_generate (non-stream) for parity with Smart Voice.")
-                # Build ChatML like Smart Voice (no extra directive), using default scene prompt
-                system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
-                messages = [
-                    Message(role="system", content=system_prompt),
-                    Message(role="user", content=final_text),
-                ]
+                # Build ChatML using clone context if enabled
+                if clone_enabled and b64_ref and clone_ref_text.strip():
+                    messages = [
+                        Message(role="user", content=clone_ref_text.strip()),
+                        Message(role="assistant", content=AudioContent(raw_audio=b64_ref, audio_url="placeholder")),
+                        Message(role="user", content=final_text),
+                    ]
+                else:
+                    system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+                    messages = [
+                        Message(role="system", content=system_prompt),
+                        Message(role="user", content=final_text),
+                    ]
                 chat_ml_full = ChatMLSample(messages=messages)
                 # Use same defaults as Smart Voice advanced controls
                 sr_full, audio_full = _run_generate(
@@ -676,9 +717,7 @@ def chat_stream_ollama_incremental_tts(
                     max_new_tokens=1024,
                 )
                 # Emit the final audio once
-                # Also send live chunk payload covering the full response
-                payload = json.dumps({"sr": int(sr_full), "b64": _pcm_to_b64(audio_full.astype(np.float32))})
-                yield (sr_full, audio_full.astype(np.float32)), final_text, payload
+                yield (sr_full, audio_full.astype(np.float32)), final_text
         return
 
     for chunk in _ollama_stream_chat(ollama_model, user_text.strip(), cancel_evt, messages=msgs):
@@ -723,7 +762,7 @@ def chat_stream_ollama_incremental_tts(
         if cancel_evt is None or not cancel_evt.is_set():
             final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
             final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
-            yield (sr, final_audio), transcript_acc, ""
+            yield (sr, final_audio), transcript_acc
 
 
 def _append_history(history: Optional[list], user_text: str, assistant_text: str) -> list:
@@ -894,7 +933,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             top_k = gr.Slider(0, 100, value=50, step=1, label="top_k")
             max_new_tokens = gr.Slider(64, 2048, value=1024, step=64, label="max_new_tokens")
         btn_smart = gr.Button("Generate", variant="primary")
-        audio_out_smart = gr.Audio(label="Output", type="numpy")
+        audio_out_smart = gr.Audio(label="Output", type="numpy", autoplay=True)
         btn_smart.click(
             tts_smart,
             inputs=[transcript, scene_desc, temperature, top_p, top_k, max_new_tokens],
@@ -914,7 +953,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             top_k_c = gr.Slider(0, 100, value=50, step=1, label="top_k")
             max_new_tokens_c = gr.Slider(64, 2048, value=1024, step=64, label="max_new_tokens")
         btn_clone = gr.Button("Generate", variant="primary")
-        audio_out_clone = gr.Audio(label="Output", type="numpy")
+        audio_out_clone = gr.Audio(label="Output", type="numpy", autoplay=True)
         btn_clone.click(
             tts_clone,
             inputs=[ref_audio, ref_text, target_text, temperature_c, top_p_c, top_k_c, max_new_tokens_c],
@@ -932,7 +971,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             top_k_m = gr.Slider(0, 100, value=50, step=1, label="top_k")
             max_new_tokens_m = gr.Slider(64, 4096, value=1536, step=64, label="max_new_tokens")
         btn_ms = gr.Button("Generate", variant="primary")
-        audio_out_ms = gr.Audio(label="Output", type="numpy")
+        audio_out_ms = gr.Audio(label="Output", type="numpy", autoplay=True)
         btn_ms.click(
             tts_multispeaker,
             inputs=[transcript_ms, scene_desc_ms, temperature_m, top_p_m, top_k_m, max_new_tokens_m],
@@ -987,9 +1026,16 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             btn_start_chat = gr.Button("Start Streaming", variant="primary")
             btn_stop_chat = gr.Button("Stop", variant="stop")
         with gr.Row():
-            audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy")
+            audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy", autoplay=True)
         with gr.Row():
             text_out_chat = gr.Textbox(label="Assistant (streaming transcript)", lines=6)
+        with gr.Accordion("Voice Cloning (optional)", open=False):
+            with gr.Row():
+                clone_enabled = gr.Checkbox(value=False, label="Use voice cloning for assistant replies")
+            with gr.Row():
+                clone_ref_audio = gr.File(label="Reference voice audio (wav/mp3)")
+            with gr.Row():
+                clone_ref_text = gr.Textbox(label="Reference transcription (what the reference audio says)", lines=2)
 
         # Cancellation token state and chat history state for the current session
         cancel_state = gr.State(value=None)
@@ -1002,7 +1048,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             outputs=[cancel_state],
         ).then(
             chat_stream_entry,
-            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state],
+            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state, clone_enabled, clone_ref_audio, clone_ref_text],
             outputs=[audio_out_chat, text_out_chat],
         ).then(
             _append_history,
@@ -1020,7 +1066,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             outputs=[cancel_state],
         ).then(
             chat_stream_entry,
-            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state],
+            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state, clone_enabled, clone_ref_audio, clone_ref_text],
             outputs=[audio_out_chat, text_out_chat],
         ).then(
             _append_history,
