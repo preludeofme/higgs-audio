@@ -169,13 +169,14 @@ def chat_stream_mock(
             wpos += take
         transcript = " ".join(transcript_chunks)
 
-        # Yield progressive audio and transcript
-        yield (sr, acc), transcript
+        # Yield only the new chunk to avoid restarting playback
+        chunk = full_wave[pos:nxt]
+        yield (sr, chunk), transcript
         time.sleep(step / 1000.0)
         pos = nxt
 
-    # Final yield to ensure completion
-    yield (sr, acc), " ".join(words)
+    # Final yield: only update transcript to avoid replacing audio buffer
+    yield gr.update(), " ".join(words)
 
 
 def _build_chatml_for_text(user_text: str) -> ChatMLSample:
@@ -289,11 +290,10 @@ def chat_stream_tts_realtime(
                         if new_tail.size > 0:
                             acc_pcm = np.concatenate([acc_pcm, new_tail.astype(np.float32)])
                             last_decoded_len = pcm.shape[0]
-                            # Use streamed transcript if available; avoid echoing the user's input
-                            safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                             if stop_evt.is_set():
                                 break
-                            yield (sr, safe_audio), (transcript_acc or "")
+                            # Yield only the new tail chunk to avoid restarting playback
+                            yield (sr, new_tail.astype(np.float32)), (transcript_acc or "")
                 except Exception:
                     # If decode fails on partial tokens, continue accumulating
                     pass
@@ -301,10 +301,10 @@ def chat_stream_tts_realtime(
         # Stream text tokens if present
         if getattr(item, "text", None):
             transcript_acc += item.text
-            # yield current audio with updated transcript
+            # Text-only update: do not touch audio
             if stop_evt.is_set():
                 break
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+            yield gr.update(), transcript_acc
 
     # Final flush: one more decode attempt
     if token_buf is not None:
@@ -322,9 +322,8 @@ def chat_stream_tts_realtime(
             pass
 
     if not stop_evt.is_set():
-        final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
-        final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
-        yield (sr, final_audio), (transcript_acc or user_text)
+        # Final text update only; leave audio as-is to avoid restart
+        yield gr.update(), (transcript_acc or user_text)
 
 
 def chat_stream_entry(
@@ -601,12 +600,11 @@ def chat_stream_ollama_incremental_tts(
                 top_k=50,
                 max_new_tokens=1024,
             )
-            # Append without overlap
+            # Append without overlap; yield only the new segment chunk
             if audio_seg is not None and audio_seg.size > 0:
                 acc_pcm = _crossfade_concat(acc_pcm, audio_seg.astype(np.float32), sr_seg, 0)
-                safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                 if cancel_evt is None or not cancel_evt.is_set():
-                    yield (sr_seg, safe_audio), transcript_acc
+                    yield (sr_seg, audio_seg.astype(np.float32)), transcript_acc
             return
 
         # Fallback: original delta-stream path for non-sentence-aware mode
@@ -655,9 +653,8 @@ def chat_stream_ollama_incremental_tts(
                         new_tail = pcm[last_decoded_len:]
                         if new_tail.size > 0:
                             acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, seg_overlap_ms)
-                            safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                             if cancel_evt is None or not cancel_evt.is_set():
-                                yield (sr, safe_audio), transcript_acc
+                                yield (sr, new_tail.astype(np.float32)), transcript_acc
                         last_decoded_len = pcm.shape[0]
                     except Exception:
                         pass
@@ -673,9 +670,8 @@ def chat_stream_ollama_incremental_tts(
                     if new_tail.size > 0:
                         overlap_ms = 0 if sentence_aware_stream else seg_overlap_ms
                         acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, overlap_ms)
-                        safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
                         if cancel_evt is None or not cancel_evt.is_set():
-                            yield (sr, safe_audio), transcript_acc
+                            yield (sr, new_tail.astype(np.float32)), transcript_acc
             except Exception:
                 pass
 
@@ -689,7 +685,8 @@ def chat_stream_ollama_incremental_tts(
             if cancel_evt is not None and cancel_evt.is_set():
                 break
             full_text += chunk
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), full_text
+            # Text-only update during buffering
+            yield gr.update(), full_text
         if cancel_evt is None or not cancel_evt.is_set():
             final_text = full_text.strip()
             if final_text:
@@ -716,7 +713,7 @@ def chat_stream_ollama_incremental_tts(
                     top_k=50,
                     max_new_tokens=1024,
                 )
-                # Emit the final audio once
+                # Emit the final audio once as a single chunk
                 yield (sr_full, audio_full.astype(np.float32)), final_text
         return
 
@@ -725,10 +722,10 @@ def chat_stream_ollama_incremental_tts(
             break
         buf += chunk
         transcript_acc += chunk
-        # Always update transcript promptly
+        # Always update transcript promptly without touching audio
         if cancel_evt is not None and cancel_evt.is_set():
             break
-        yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+        yield gr.update(), transcript_acc
         while True:
             if sentence_aware_stream:
                 seg, rem = _pop_sentence(buf)
@@ -737,8 +734,8 @@ def chat_stream_ollama_incremental_tts(
             if not seg:
                 break
             buf = rem
-            # Ensure transcript shows before starting audio for this unit
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+            # Ensure transcript shows before starting audio for this unit (text-only)
+            yield gr.update(), transcript_acc
             # Synthesize this unit and stream its audio (single run per unit)
             if cancel_evt is not None and cancel_evt.is_set():
                 break
@@ -760,9 +757,8 @@ def chat_stream_ollama_incremental_tts(
             if tail:
                 yield from synth_and_stream(tail)
         if cancel_evt is None or not cancel_evt.is_set():
-            final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
-            final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
-            yield (sr, final_audio), transcript_acc
+            # Final text update only to avoid buffer replacement
+            yield gr.update(), transcript_acc
 
 
 def _append_history(history: Optional[list], user_text: str, assistant_text: str) -> list:
@@ -1026,7 +1022,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
             btn_start_chat = gr.Button("Start Streaming", variant="primary")
             btn_stop_chat = gr.Button("Stop", variant="stop")
         with gr.Row():
-            audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy", autoplay=True)
+            audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy", autoplay=True, streaming=True)
         with gr.Row():
             text_out_chat = gr.Textbox(label="Assistant (streaming transcript)", lines=6)
         with gr.Accordion("Voice Cloning (optional)", open=False):
