@@ -13,7 +13,15 @@ import base64
 import os
 import sys
 from io import BytesIO
+import time
+import asyncio
+import threading
+import queue as pyqueue
+import subprocess
 from typing import Optional, Tuple
+import json
+import urllib.request
+import urllib.error
 
 import gradio as gr
 import numpy as np
@@ -29,6 +37,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+from boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
 
 # --------- Global initialization (single load) ---------
@@ -89,6 +98,294 @@ def tts_smart(transcript: str, scene_desc: str, temperature: float, top_p: float
     ]
     chat_ml = ChatMLSample(messages=messages)
     return _run_generate(chat_ml, temperature=temperature, top_p=top_p, top_k=int(top_k), max_new_tokens=int(max_new_tokens))
+
+
+# --------- Mock Chat Streaming (UI-first) ---------
+def chat_stream_mock(
+    user_text: str,
+    llm_provider: str,
+    voice_mode: str,
+    chunk_ms: int,
+    ollama_model: str = "",
+):
+    """Simulate a streaming TTS session.
+
+    Yields progressively longer audio (sine wave) and transcript text.
+    Keeps the UI interactive and demonstrates streaming UX before real wiring.
+    """
+    if not user_text.strip():
+        raise gr.Error("Please enter a prompt to chat.")
+
+    # Sine-wave parameters
+    sr = 24000
+    total_s = 6.0  # total mock audio duration
+    freq = 440.0 if voice_mode == "Default" else (220.0 if voice_mode == "Warm" else 660.0)
+    samples_total = int(total_s * sr)
+    t = np.arange(samples_total) / sr
+    full_wave = 0.2 * np.sin(2 * np.pi * freq * t).astype(np.float32)
+
+    # Chunking
+    step = max(40, int(chunk_ms))  # ms
+    step_samples = int(sr * (step / 1000.0))
+
+    # Progressive buffer and transcript
+    acc = np.zeros(0, dtype=np.float32)
+    transcript_chunks = []
+    words = (user_text.strip() + " ").split()
+    words_per_chunk = max(1, len(words) // max(1, samples_total // max(1, step_samples)))
+
+    # Initial yield: tiny epsilon to avoid zero-length and zero-max normalization warnings
+    yield (sr, np.array([1e-6], dtype=np.float32)), ""
+
+    pos = 0
+    wpos = 0
+    while pos < samples_total:
+        nxt = min(samples_total, pos + step_samples)
+        acc = np.concatenate([acc, full_wave[pos:nxt]])
+
+        # Simulate transcript trickle
+        if wpos < len(words):
+            take = min(words_per_chunk, len(words) - wpos)
+            transcript_chunks.extend(words[wpos:wpos + take])
+            wpos += take
+        transcript = " ".join(transcript_chunks)
+
+        # Yield progressive audio and transcript
+        yield (sr, acc), transcript
+        time.sleep(step / 1000.0)
+        pos = nxt
+
+    # Final yield to ensure completion
+    yield (sr, acc), " ".join(words)
+
+
+def _build_chatml_for_text(user_text: str) -> ChatMLSample:
+    system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+    messages = [
+        Message(role="system", content=system_prompt),
+        Message(role="user", content=user_text.strip()),
+    ]
+    return ChatMLSample(messages=messages)
+
+
+def chat_stream_tts_realtime(
+    user_text: str,
+    llm_provider: str,
+    voice_mode: str,
+    chunk_ms: int,
+    ollama_model: str = "",
+):
+    """Real-time streaming using HiggsAudio generate_delta_stream.
+
+    For now, bypasses LLM and synthesizes the user's text directly for low-latency demo.
+    """
+    if not user_text.strip():
+        raise gr.Error("Please enter a prompt to chat.")
+
+    engine = _lazy_init()
+    chat_ml = _build_chatml_for_text(user_text)
+
+    # Threaded async producer -> queue of deltas
+    q: pyqueue.Queue = pyqueue.Queue(maxsize=128)
+    stop_evt = threading.Event()
+
+    async def producer():
+        try:
+            async for delta in engine.generate_delta_stream(
+                chat_ml_sample=chat_ml,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=50,
+                stop_strings=["<|end_of_text|>", "<|eot_id|>", "<|audio_eos|>"],
+            ):
+                if stop_evt.is_set():
+                    break
+                q.put(delta)
+        finally:
+            q.put(None)
+
+    def run_loop():
+        asyncio.run(producer())
+
+    th = threading.Thread(target=run_loop, daemon=True)
+    th.start()
+
+    # Progressive PCM buffer
+    sr = engine.audio_tokenizer.sampling_rate
+    acc_pcm = np.zeros(0, dtype=np.float32)
+    last_decoded_len = 0
+
+    # Buffer of audio tokens [codebooks, frames]
+    token_buf = None  # torch.Tensor or None
+
+    # Initial yield: tiny epsilon to avoid zero-length and normalization warnings
+    yield (sr, np.array([1e-6], dtype=np.float32)), ""
+
+    transcript_acc = ""
+    while True:
+        item = q.get()
+        if item is None:
+            break
+
+        # Collect audio tokens
+        if item.audio_tokens is not None:
+            at = item.audio_tokens  # [codebooks, frames]
+            token_buf = at if token_buf is None else torch.cat([token_buf, at], dim=1)
+
+            # Decode when we have a sufficient buffer (~chunk_ms)
+            frames_per_ms = engine.audio_tokenizer.tps / 1000.0
+            min_frames = int(max(1, chunk_ms * frames_per_ms))
+            if token_buf.shape[1] >= min_frames:
+                try:
+                    # Prepare vq code: handle delay pattern; keep BOS removal, EOS may not exist yet
+                    vq_code = revert_delay_pattern(token_buf).clip(0, engine.audio_codebook_size - 1)
+                    if vq_code.shape[1] > 1:
+                        vq_code = vq_code[:, 1:]
+                    # Decode whole buffer, then append only new tail
+                    pcm = engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+                    if pcm.shape[0] > last_decoded_len:
+                        new_tail = pcm[last_decoded_len:]
+                        if new_tail.size > 0:
+                            acc_pcm = np.concatenate([acc_pcm, new_tail.astype(np.float32)])
+                            last_decoded_len = pcm.shape[0]
+                            # Use streamed transcript if available; avoid echoing the user's input
+                            safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
+                            yield (sr, safe_audio), (transcript_acc or "")
+                except Exception:
+                    # If decode fails on partial tokens, continue accumulating
+                    pass
+
+        # Stream text tokens if present
+        if getattr(item, "text", None):
+            transcript_acc += item.text
+            # yield current audio with updated transcript
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+
+    # Final flush: one more decode attempt
+    if token_buf is not None:
+        try:
+            vq_code = revert_delay_pattern(token_buf).clip(0, engine.audio_codebook_size - 1)
+            if vq_code.shape[1] > 1:
+                vq_code = vq_code[:, 1:]
+            pcm = engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+            if pcm.shape[0] > last_decoded_len:
+                new_tail = pcm[last_decoded_len:]
+                if new_tail.size > 0:
+                    acc_pcm = np.concatenate([acc_pcm, new_tail.astype(np.float32)])
+                    last_decoded_len = pcm.shape[0]
+        except Exception:
+            pass
+
+    final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
+    final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
+    yield (sr, final_audio), (transcript_acc or user_text)
+
+
+def chat_stream_entry(user_text: str, llm_provider: str, voice_mode: str, chunk_ms: int, ollama_model: str = ""):
+    if llm_provider == "Mock":
+        yield from chat_stream_mock(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
+    elif llm_provider == "Direct TTS":
+        yield from chat_stream_tts_realtime(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
+    elif llm_provider == "Ollama":
+        yield from chat_stream_ollama_tts(user_text, ollama_model or "")
+    else:
+        # Placeholder before LLM integration
+        yield from chat_stream_mock(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
+
+
+# --------- Ollama helpers ---------
+def list_ollama_models() -> list[str]:
+    """Return installed Ollama model names by calling `ollama list`.
+    Falls back to an empty list on failure.
+    """
+    try:
+        proc = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        # Skip header if present (starts with NAME)
+        names = []
+        for ln in lines:
+            if ln.lower().startswith("name"):
+                continue
+            # First column is model name (split by whitespace)
+            parts = ln.split()
+            if parts:
+                names.append(parts[0])
+        # Deduplicate, preserve order
+        seen = set()
+        out = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+    except Exception:
+        return []
+
+
+def _ollama_stream_chat(model: str, prompt: str):
+    """Stream assistant tokens from Ollama's /api/chat endpoint.
+    Yields text chunks (strings). Requires local Ollama at http://localhost:11434.
+    """
+    url = "http://localhost:11434/api/chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            for raw in resp:
+                try:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if obj.get("done"):
+                        break
+                    msg = obj.get("message", {})
+                    chunk = msg.get("content", "")
+                    if chunk:
+                        yield chunk
+                except Exception:
+                    continue
+    except urllib.error.URLError as e:
+        raise gr.Error(f"Failed to reach Ollama at localhost:11434: {e}")
+
+
+def chat_stream_ollama_tts(user_text: str, ollama_model: str):
+    """Stream transcript from Ollama, then synthesize final audio with Higgs.
+
+    For now, audio is generated once at the end (non-streaming) to keep the flow simple and working.
+    """
+    if not user_text.strip():
+        raise gr.Error("Please enter a prompt to chat.")
+    if not ollama_model or ollama_model.startswith("<no "):
+        raise gr.Error("Please select a valid Ollama model.")
+
+    # Initial tiny epsilon to prime the Audio component
+    yield (24000, np.array([1e-6], dtype=np.float32)), ""
+
+    # Stream assistant text as it arrives
+    transcript_acc = ""
+    for chunk in _ollama_stream_chat(ollama_model, user_text.strip()):
+        transcript_acc += chunk
+        yield (24000, np.array([1e-6], dtype=np.float32)), transcript_acc
+
+    # Synthesize full assistant message to audio
+    if transcript_acc.strip():
+        system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+        messages = [
+            Message(role="system", content=system_prompt),
+            Message(role="user", content=transcript_acc.strip()),
+        ]
+        chat_ml = ChatMLSample(messages=messages)
+        sr, audio = _run_generate(chat_ml, temperature=0.5, top_p=0.95, top_k=50, max_new_tokens=1536)
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+        yield (sr, audio), transcript_acc
+    else:
+        yield (24000, np.array([1e-6], dtype=np.float32)), "(No response from Ollama)"
 
 
 def tts_clone(reference_audio, reference_text: str, target_transcript: str, temperature: float, top_p: float, top_k: int, max_new_tokens: int):
@@ -299,6 +596,42 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
         btn_asr = gr.Button("Transcribe", variant="primary")
         asr_text = gr.Textbox(label="Transcription", lines=8)
         btn_asr.click(transcribe_audio, inputs=[asr_file, asr_lang], outputs=[asr_text])
+
+    with gr.Tab("Chat"):
+        gr.Markdown(
+            """
+            ### Chat with TTS (Mock Streaming)
+            This tab simulates near-real-time audio streaming. After approval, we'll wire it to an LLM and the real
+            `generate_delta_stream()` for low-latency voice responses.
+            """
+        )
+        with gr.Row():
+            chat_input = gr.Textbox(label="Your message", placeholder="Ask me anything...", lines=3)
+        with gr.Row():
+            llm_provider = gr.Dropdown(
+                ["Mock", "Direct TTS", "Ollama", "OpenAI", "Local vLLM"],
+                value="Mock",
+                label="LLM Provider",
+            )
+            voice_mode = gr.Dropdown(["Default", "Warm", "Bright"], value="Default", label="Voice preset")
+            chunk_ms = gr.Slider(40, 400, value=120, step=20, label="Chunk duration (ms)")
+            ollama_model = gr.Dropdown(
+                choices=(list_ollama_models() or ["<no local models detected>"]),
+                value=None,
+                label="Ollama model (if provider is Ollama)",
+            )
+        with gr.Row():
+            btn_start_chat = gr.Button("Start Streaming", variant="primary")
+        with gr.Row():
+            audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy")
+        with gr.Row():
+            text_out_chat = gr.Textbox(label="Assistant (streaming transcript)", lines=6)
+
+        btn_start_chat.click(
+            chat_stream_entry,
+            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model],
+            outputs=[audio_out_chat, text_out_chat],
+        )
 
 
 if __name__ == "__main__":
