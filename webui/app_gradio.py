@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import json
 import urllib.request
 import urllib.error
+import re
 
 import gradio as gr
 import numpy as np
@@ -69,6 +70,24 @@ def _build_system_prompt(scene_desc: str) -> str:
         f"{scene_desc}\n"
         "<|scene_desc_end|>"
     )
+
+
+def _clear_text() -> str:
+    """Utility for Gradio .then() to clear a Textbox value."""
+    return ""
+
+
+def _create_cancel_event():
+    """Create a new cancellation token for a streaming session."""
+    return threading.Event()
+
+
+def _cancel_event(evt: Optional[threading.Event]):
+    """Set the cancellation token if present (wired to Stop button)."""
+    if isinstance(evt, threading.Event):
+        evt.set()
+    # No UI outputs to update here; returning None keeps Gradio happy
+    return None
 
 
 def _run_generate(chat_ml: ChatMLSample, *, temperature: float, top_p: float, top_k: int, max_new_tokens: int) -> Tuple[int, np.ndarray]:
@@ -160,10 +179,14 @@ def chat_stream_mock(
 
 
 def _build_chatml_for_text(user_text: str) -> ChatMLSample:
-    system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+    # Strong directive to read the given text verbatim to avoid paraphrasing
+    system_prompt = (
+        "You are a TTS engine. Read the following text VERBATIM, without adding or changing words.\n\n"
+        + _build_system_prompt("Audio is recorded from a quiet room.")
+    )
     messages = [
         Message(role="system", content=system_prompt),
-        Message(role="user", content=user_text.strip()),
+        Message(role="user", content=f"Read exactly this: {user_text.strip()}"),
     ]
     return ChatMLSample(messages=messages)
 
@@ -174,6 +197,7 @@ def chat_stream_tts_realtime(
     voice_mode: str,
     chunk_ms: int,
     ollama_model: str = "",
+    cancel_evt: Optional[threading.Event] = None,
 ):
     """Real-time streaming using HiggsAudio generate_delta_stream.
 
@@ -183,18 +207,19 @@ def chat_stream_tts_realtime(
         raise gr.Error("Please enter a prompt to chat.")
 
     engine = _lazy_init()
+    print(f"[DirectTTS] Synthesizing user text (len={len(user_text.strip())}): {user_text.strip()[:160]!r}")
     chat_ml = _build_chatml_for_text(user_text)
 
     # Threaded async producer -> queue of deltas
     q: pyqueue.Queue = pyqueue.Queue(maxsize=128)
-    stop_evt = threading.Event()
+    stop_evt = cancel_evt or threading.Event()
 
     async def producer():
         try:
             async for delta in engine.generate_delta_stream(
                 chat_ml_sample=chat_ml,
                 max_new_tokens=1024,
-                temperature=0.7,
+                temperature=0.3,
                 top_p=0.95,
                 top_k=50,
                 stop_strings=["<|end_of_text|>", "<|eot_id|>", "<|audio_eos|>"],
@@ -224,19 +249,34 @@ def chat_stream_tts_realtime(
 
     transcript_acc = ""
     while True:
-        item = q.get()
+        # Check for cancellation promptly
+        if stop_evt.is_set():
+            break
+        try:
+            item = q.get(timeout=0.05)
+        except pyqueue.Empty:
+            continue
         if item is None:
             break
 
         # Collect audio tokens
         if item.audio_tokens is not None:
-            at = item.audio_tokens  # [codebooks, frames]
-            token_buf = at if token_buf is None else torch.cat([token_buf, at], dim=1)
+            at = item.audio_tokens
+            # Normalize to 2D [codebooks, frames]
+            if at.ndim == 1:
+                at = at.unsqueeze(0)
+            if at.ndim != 2:
+                at = None
+            if at is not None:
+                if token_buf is None or token_buf.ndim != 2 or token_buf.shape[0] != at.shape[0]:
+                    token_buf = at
+                else:
+                    token_buf = torch.cat([token_buf, at], dim=1)
 
             # Decode when we have a sufficient buffer (~chunk_ms)
             frames_per_ms = engine.audio_tokenizer.tps / 1000.0
             min_frames = int(max(1, chunk_ms * frames_per_ms))
-            if token_buf.shape[1] >= min_frames:
+            if token_buf is not None and token_buf.ndim == 2 and token_buf.shape[1] >= min_frames:
                 try:
                     # Prepare vq code: handle delay pattern; keep BOS removal, EOS may not exist yet
                     vq_code = revert_delay_pattern(token_buf).clip(0, engine.audio_codebook_size - 1)
@@ -251,6 +291,8 @@ def chat_stream_tts_realtime(
                             last_decoded_len = pcm.shape[0]
                             # Use streamed transcript if available; avoid echoing the user's input
                             safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
+                            if stop_evt.is_set():
+                                break
                             yield (sr, safe_audio), (transcript_acc or "")
                 except Exception:
                     # If decode fails on partial tokens, continue accumulating
@@ -260,7 +302,9 @@ def chat_stream_tts_realtime(
         if getattr(item, "text", None):
             transcript_acc += item.text
             # yield current audio with updated transcript
-            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+            if stop_evt.is_set():
+                break
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc, ""
 
     # Final flush: one more decode attempt
     if token_buf is not None:
@@ -277,18 +321,43 @@ def chat_stream_tts_realtime(
         except Exception:
             pass
 
-    final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
-    final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
-    yield (sr, final_audio), (transcript_acc or user_text)
+    if not stop_evt.is_set():
+        final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
+        final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
+        yield (sr, final_audio), (transcript_acc or user_text)
 
 
-def chat_stream_entry(user_text: str, llm_provider: str, voice_mode: str, chunk_ms: int, ollama_model: str = ""):
+def chat_stream_entry(
+    user_text: str,
+    llm_provider: str,
+    voice_mode: str,
+    chunk_ms: int,
+    ollama_model: str = "",
+    seg_min_chars: int = 80,
+    seg_max_chars: int = 200,
+    seg_overlap_ms: int = 30,
+    full_response_tts: bool = False,
+    sentence_aware_stream: bool = False,
+    cancel_evt: Optional[threading.Event] = None,
+    chat_history: Optional[list] = None,
+):
     if llm_provider == "Mock":
         yield from chat_stream_mock(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
     elif llm_provider == "Direct TTS":
-        yield from chat_stream_tts_realtime(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
+        yield from chat_stream_tts_realtime(user_text, llm_provider, voice_mode, chunk_ms, ollama_model, cancel_evt)
     elif llm_provider == "Ollama":
-        yield from chat_stream_ollama_tts(user_text, ollama_model or "")
+        yield from chat_stream_ollama_incremental_tts(
+            user_text,
+            ollama_model,
+            int(seg_min_chars),
+            int(seg_max_chars),
+            int(seg_overlap_ms),
+            int(chunk_ms),
+            bool(full_response_tts),
+            bool(sentence_aware_stream),
+            cancel_evt,
+            chat_history,
+        )
     else:
         # Placeholder before LLM integration
         yield from chat_stream_mock(user_text, llm_provider, voice_mode, chunk_ms, ollama_model)
@@ -323,14 +392,14 @@ def list_ollama_models() -> list[str]:
         return []
 
 
-def _ollama_stream_chat(model: str, prompt: str):
+def _ollama_stream_chat(model: str, prompt: str, cancel_evt: Optional[threading.Event] = None, messages: Optional[list] = None):
     """Stream assistant tokens from Ollama's /api/chat endpoint.
     Yields text chunks (strings). Requires local Ollama at http://localhost:11434.
     """
     url = "http://localhost:11434/api/chat"
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages if isinstance(messages, list) and len(messages) > 0 else [{"role": "user", "content": prompt}],
         "stream": True,
     }
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
@@ -338,6 +407,8 @@ def _ollama_stream_chat(model: str, prompt: str):
         with urllib.request.urlopen(req, timeout=60) as resp:
             for raw in resp:
                 try:
+                    if cancel_evt is not None and cancel_evt.is_set():
+                        break
                     line = raw.decode("utf-8").strip()
                     if not line:
                         continue
@@ -386,6 +457,285 @@ def chat_stream_ollama_tts(user_text: str, ollama_model: str):
         yield (sr, audio), transcript_acc
     else:
         yield (24000, np.array([1e-6], dtype=np.float32)), "(No response from Ollama)"
+
+
+def _crossfade_concat(acc: np.ndarray, new: np.ndarray, sr: int, overlap_ms: int) -> np.ndarray:
+    """Linearly crossfade 'new' into the end of 'acc' over overlap_ms."""
+    if acc.size == 0 or overlap_ms <= 0:
+        return np.concatenate([acc, new]) if acc.size > 0 else new
+    overlap = int(sr * (overlap_ms / 1000.0))
+    if overlap <= 0 or acc.size < overlap or new.size < overlap:
+        return np.concatenate([acc, new])
+    fade_out = np.linspace(1.0, 0.0, num=overlap, dtype=np.float32)
+    fade_in = 1.0 - fade_out
+    mixed_tail = acc[-overlap:] * fade_out + new[:overlap] * fade_in
+    return np.concatenate([acc[:-overlap], mixed_tail, new[overlap:]]).astype(np.float32)
+
+
+def _pop_segment(buf: str, min_chars: int, max_chars: int) -> tuple[str, str]:
+    """Return (segment, remainder) if a segment boundary is found, else ("", buf)."""
+    if len(buf) < min_chars:
+        return "", buf
+    # Prefer punctuation boundary
+    m = None
+    for punct in [".", "!", "?", "。", "！", "？", ";", ":", ","]:
+        idx = buf.rfind(punct, 0, max(min(len(buf), max_chars) + 1, 0))
+        if idx != -1 and idx + 1 >= min_chars:
+            m = idx + 1
+            break
+    if m is None and len(buf) >= max_chars:
+        m = max_chars
+    if m is None:
+        return "", buf
+    seg = buf[:m].strip()
+    rem = buf[m:]
+    return seg, rem
+
+
+_SENTENCE_RE = re.compile(r"(.+?[\.\!\?\u2026]+)(\s+|$)")
+
+
+def _pop_sentence(buf: str, min_len: int = 12) -> tuple[str, str]:
+    """
+    Extract the next complete sentence from buf.
+    Returns (sentence, remainder) or ("", buf) if no complete sentence yet.
+    A sentence ends with ., !, ?, or … (unicode ellipsis). Requires a minimal length to avoid tiny fragments.
+    """
+    if len(buf.strip()) < min_len:
+        return "", buf
+    m = _SENTENCE_RE.match(buf)
+    if not m:
+        return "", buf
+    sent = m.group(1).strip()
+    rem = buf[m.end():]
+    if len(sent) < min_len:
+        return "", buf
+    return sent, rem
+
+
+def chat_stream_ollama_incremental_tts(
+    user_text: str,
+    ollama_model: str,
+    seg_min_chars: int,
+    seg_max_chars: int,
+    seg_overlap_ms: int,
+    chunk_ms: int,
+    full_response_tts: bool = False,
+    sentence_aware_stream: bool = False,
+    cancel_evt: Optional[threading.Event] = None,
+    chat_history: Optional[list] = None,
+):
+    """Stream text from Ollama and synthesize audio per segment incrementally."""
+    if not user_text.strip():
+        raise gr.Error("Please enter a prompt to chat.")
+    if not ollama_model or ollama_model.startswith("<no "):
+        raise gr.Error("Please select a valid Ollama model.")
+
+    engine = _lazy_init()
+    sr = engine.audio_tokenizer.sampling_rate
+
+    # Prime Audio and live sink (empty)
+    yield (sr, np.array([1e-6], dtype=np.float32)), "", ""
+
+    transcript_acc = ""
+    buf = ""
+    acc_pcm = np.zeros(0, dtype=np.float32)
+
+    def _pcm_to_b64(arr: np.ndarray) -> str:
+        x = np.asarray(arr, dtype=np.float32).tobytes()
+        return base64.b64encode(x).decode("ascii")
+
+    def synth_and_stream(segment_text: str):
+        nonlocal acc_pcm
+        st = segment_text.strip()
+        print(f"[OllamaTTS] Synthesizing segment (len={len(st)}): {st[:160]!r}")
+
+        # In sentence-aware mode, use non-streaming generation for Smart Voice parity
+        if sentence_aware_stream:
+            system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+            messages = [
+                Message(role="system", content=system_prompt),
+                Message(role="user", content=st),
+            ]
+            chat_ml = ChatMLSample(messages=messages)
+            sr_seg, audio_seg = _run_generate(
+                chat_ml,
+                temperature=0.3,
+                top_p=0.95,
+                top_k=50,
+                max_new_tokens=1024,
+            )
+            # Append without overlap
+            if audio_seg is not None and audio_seg.size > 0:
+                acc_pcm = _crossfade_concat(acc_pcm, audio_seg.astype(np.float32), sr_seg, 0)
+                safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
+                if cancel_evt is None or not cancel_evt.is_set():
+                    # Send live chunk to WebAudio sink as base64 Float32 JSON {sr,b64}
+                    payload = json.dumps({"sr": int(sr_seg), "b64": _pcm_to_b64(audio_seg.astype(np.float32))})
+                    yield (sr_seg, safe_audio), transcript_acc, payload
+            return
+
+        # Fallback: original delta-stream path for non-sentence-aware mode
+        chat_ml = _build_chatml_for_text(st)
+
+        q: pyqueue.Queue = pyqueue.Queue(maxsize=128)
+        async def producer():
+            try:
+                async for delta in engine.generate_delta_stream(
+                    chat_ml_sample=chat_ml,
+                    max_new_tokens=1024,
+                    temperature=0.3,
+                    top_p=0.95,
+                    top_k=50,
+                    stop_strings=["<|end_of_text|>", "<|eot_id|>", "<|audio_eos|>"],
+                ):
+                    if cancel_evt is not None and cancel_evt.is_set():
+                        break
+                    q.put(delta)
+            finally:
+                q.put(None)
+
+        th = threading.Thread(target=lambda: asyncio.run(producer()), daemon=True)
+        th.start()
+
+        token_buf: Optional[torch.Tensor] = None
+        last_decoded_len = 0
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            if cancel_evt is not None and cancel_evt.is_set():
+                break
+            if isinstance(item, AudioContent) and item.audio_tokens is not None:
+                if token_buf is None:
+                    token_buf = item.audio_tokens
+                else:
+                    token_buf = torch.cat([token_buf, item.audio_tokens], dim=1)
+
+                if token_buf is not None and token_buf.shape[1] - last_decoded_len >= 8:
+                    try:
+                        vq_code = revert_delay_pattern(token_buf).clip(0, engine.audio_codebook_size - 1)
+                        if vq_code.shape[1] > 1:
+                            vq_code = vq_code[:, 1:]
+                        pcm = engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+                        new_tail = pcm[last_decoded_len:]
+                        if new_tail.size > 0:
+                            acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, seg_overlap_ms)
+                            safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
+                            if cancel_evt is None or not cancel_evt.is_set():
+                                yield (sr, safe_audio), transcript_acc, ""
+                        last_decoded_len = pcm.shape[0]
+                    except Exception:
+                        pass
+
+        if token_buf is not None and token_buf.ndim == 2 and not (cancel_evt is not None and cancel_evt.is_set()):
+            try:
+                vq_code = revert_delay_pattern(token_buf).clip(0, engine.audio_codebook_size - 1)
+                if vq_code.shape[1] > 1:
+                    vq_code = vq_code[:, 1:]
+                pcm = engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+                if pcm.shape[0] > last_decoded_len:
+                    new_tail = pcm[last_decoded_len:]
+                    if new_tail.size > 0:
+                        overlap_ms = 0 if sentence_aware_stream else seg_overlap_ms
+                        acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, overlap_ms)
+                        safe_audio = np.nan_to_num(acc_pcm, nan=0.0, posinf=0.0, neginf=0.0)
+                        if cancel_evt is None or not cancel_evt.is_set():
+                            yield (sr, safe_audio), transcript_acc, ""
+            except Exception:
+                pass
+
+    # Stream text and synthesize segments
+    history_msgs = chat_history if isinstance(chat_history, list) else []
+    msgs = [*history_msgs, {"role": "user", "content": user_text.strip()}]
+    if full_response_tts:
+        # Buffer full LLM text first, updating transcript as it arrives, then synthesize once
+        full_text = ""
+        for chunk in _ollama_stream_chat(ollama_model, user_text.strip(), cancel_evt, messages=msgs):
+            if cancel_evt is not None and cancel_evt.is_set():
+                break
+            full_text += chunk
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), full_text, ""
+        if cancel_evt is None or not cancel_evt.is_set():
+            final_text = full_text.strip()
+            if final_text:
+                print(f"[OllamaTTS:Full] Synthesizing full response (len={len(final_text)}). Using _run_generate (non-stream) for parity with Smart Voice.")
+                # Build ChatML like Smart Voice (no extra directive), using default scene prompt
+                system_prompt = _build_system_prompt("Audio is recorded from a quiet room.")
+                messages = [
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=final_text),
+                ]
+                chat_ml_full = ChatMLSample(messages=messages)
+                # Use same defaults as Smart Voice advanced controls
+                sr_full, audio_full = _run_generate(
+                    chat_ml_full,
+                    temperature=0.3,
+                    top_p=0.95,
+                    top_k=50,
+                    max_new_tokens=1024,
+                )
+                # Emit the final audio once
+                # Also send live chunk payload covering the full response
+                payload = json.dumps({"sr": int(sr_full), "b64": _pcm_to_b64(audio_full.astype(np.float32))})
+                yield (sr_full, audio_full.astype(np.float32)), final_text, payload
+        return
+
+    for chunk in _ollama_stream_chat(ollama_model, user_text.strip(), cancel_evt, messages=msgs):
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        buf += chunk
+        transcript_acc += chunk
+        # Always update transcript promptly
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+        while True:
+            if sentence_aware_stream:
+                seg, rem = _pop_sentence(buf)
+            else:
+                seg, rem = _pop_segment(buf, seg_min_chars, seg_max_chars)
+            if not seg:
+                break
+            buf = rem
+            # Ensure transcript shows before starting audio for this unit
+            yield (sr, acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)), transcript_acc
+            # Synthesize this unit and stream its audio (single run per unit)
+            if cancel_evt is not None and cancel_evt.is_set():
+                break
+            yield from synth_and_stream(seg)
+
+    # After stream end, flush remaining buffer
+    if cancel_evt is None or not cancel_evt.is_set():
+        tail = buf.strip()
+        if tail and (cancel_evt is None or not cancel_evt.is_set()):
+            # If sentence-aware, try to flush remaining complete sentences first
+            if sentence_aware_stream:
+                while True:
+                    seg, rem = _pop_sentence(tail)
+                    if not seg:
+                        break
+                    yield from synth_and_stream(seg)
+                    tail = rem.strip()
+            # Any small leftover (no terminator) can be synthesized once
+            if tail:
+                yield from synth_and_stream(tail)
+        if cancel_evt is None or not cancel_evt.is_set():
+            final_audio = acc_pcm if acc_pcm.size > 0 else np.array([1e-6], dtype=np.float32)
+            final_audio = np.nan_to_num(final_audio, nan=0.0, posinf=0.0, neginf=0.0)
+            yield (sr, final_audio), transcript_acc, ""
+
+
+def _append_history(history: Optional[list], user_text: str, assistant_text: str) -> list:
+    """Utility to append a user/assistant turn to chat history state."""
+    hist = history if isinstance(history, list) else []
+    u = (user_text or "").strip()
+    a = (assistant_text or "").strip()
+    if u:
+        hist = [*hist, {"role": "user", "content": u}]
+    if a:
+        hist = [*hist, {"role": "assistant", "content": a}]
+    return hist
 
 
 def tts_clone(reference_audio, reference_text: str, target_transcript: str, temperature: float, top_p: float, top_k: int, max_new_tokens: int):
@@ -607,31 +957,76 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Higgs Audio v2") as demo:
         )
         with gr.Row():
             chat_input = gr.Textbox(label="Your message", placeholder="Ask me anything...", lines=3)
+            btn_send_chat = gr.Button("Send", variant="primary")
         with gr.Row():
             llm_provider = gr.Dropdown(
                 ["Mock", "Direct TTS", "Ollama", "OpenAI", "Local vLLM"],
-                value="Mock",
+                value="Ollama",
                 label="LLM Provider",
             )
             voice_mode = gr.Dropdown(["Default", "Warm", "Bright"], value="Default", label="Voice preset")
             chunk_ms = gr.Slider(40, 400, value=120, step=20, label="Chunk duration (ms)")
             ollama_model = gr.Dropdown(
-                choices=(list_ollama_models() or ["<no local models detected>"]),
-                value=None,
+                choices=(
+                    ["qwen2.5-coder:1.5b-maxctx"]
+                    + (list_ollama_models() or ["<no local models detected>"])
+                ),
+                value="qwen2.5-coder:1.5b-maxctx",
                 label="Ollama model (if provider is Ollama)",
             )
         with gr.Row():
+            full_response_toggle = gr.Checkbox(value=False, label="Full response TTS (no segmentation)")
+        with gr.Row():
+            sentence_aware_toggle = gr.Checkbox(value=True, label="Sentence-aware streaming (per sentence)")
+        with gr.Accordion("Segmentation (for Ollama incremental TTS)", open=False):
+            with gr.Row():
+                seg_min_chars = gr.Slider(40, 300, value=80, step=10, label="Min chars per segment")
+                seg_max_chars = gr.Slider(120, 500, value=200, step=10, label="Max chars per segment")
+                seg_overlap_ms = gr.Slider(0, 120, value=30, step=5, label="Audio crossfade overlap (ms)")
+        with gr.Row():
             btn_start_chat = gr.Button("Start Streaming", variant="primary")
+            btn_stop_chat = gr.Button("Stop", variant="stop")
         with gr.Row():
             audio_out_chat = gr.Audio(label="Streaming Audio", type="numpy")
         with gr.Row():
             text_out_chat = gr.Textbox(label="Assistant (streaming transcript)", lines=6)
 
+        # Cancellation token state and chat history state for the current session
+        cancel_state = gr.State(value=None)
+        chat_history_state = gr.State(value=[])
+
+        # Start: create a new cancel event, then stream
         btn_start_chat.click(
+            _create_cancel_event,
+            inputs=None,
+            outputs=[cancel_state],
+        ).then(
             chat_stream_entry,
-            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model],
+            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state],
             outputs=[audio_out_chat, text_out_chat],
-        )
+        ).then(
+            _append_history,
+            inputs=[chat_history_state, chat_input, text_out_chat],
+            outputs=[chat_history_state],
+        ).then(_clear_text, inputs=None, outputs=[chat_input])
+
+        # Stop: signal cancellation
+        btn_stop_chat.click(_cancel_event, inputs=[cancel_state], outputs=None)
+
+        # Send button mirrors Start Streaming chain (quick single-turn send)
+        btn_send_chat.click(
+            _create_cancel_event,
+            inputs=None,
+            outputs=[cancel_state],
+        ).then(
+            chat_stream_entry,
+            inputs=[chat_input, llm_provider, voice_mode, chunk_ms, ollama_model, seg_min_chars, seg_max_chars, seg_overlap_ms, full_response_toggle, sentence_aware_toggle, cancel_state, chat_history_state],
+            outputs=[audio_out_chat, text_out_chat],
+        ).then(
+            _append_history,
+            inputs=[chat_history_state, chat_input, text_out_chat],
+            outputs=[chat_history_state],
+        ).then(_clear_text, inputs=None, outputs=[chat_input])
 
 
 if __name__ == "__main__":
