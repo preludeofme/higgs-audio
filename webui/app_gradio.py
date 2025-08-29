@@ -240,6 +240,8 @@ def chat_stream_tts_realtime(
     # Progressive PCM buffer
     sr = engine.audio_tokenizer.sampling_rate
     acc_pcm = np.zeros(0, dtype=np.float32)
+    # Buffer for batching sentence-aware segments before emitting
+    emit_buf_sa = np.array([], dtype=np.float32)
     last_decoded_len = 0
 
     # Buffer of audio tokens [codebooks, frames]
@@ -566,6 +568,8 @@ def chat_stream_ollama_incremental_tts(
     transcript_acc = ""
     buf = ""
     acc_pcm = np.zeros(0, dtype=np.float32)
+    # Buffer for batching sentence-aware audio before yielding to client
+    emit_buf_sa = np.array([], dtype=np.float32)
 
     def _pcm_to_b64(arr: np.ndarray) -> str:
         x = np.asarray(arr, dtype=np.float32).tobytes()
@@ -575,6 +579,7 @@ def chat_stream_ollama_incremental_tts(
 
     def synth_and_stream(segment_text: str):
         nonlocal acc_pcm
+        nonlocal emit_buf_sa
         st = segment_text.strip()
         print(f"[OllamaTTS] Synthesizing segment (len={len(st)}): {st[:160]!r}")
 
@@ -600,17 +605,24 @@ def chat_stream_ollama_incremental_tts(
                 top_k=50,
                 max_new_tokens=1024,
             )
-            # Append without overlap; yield only the new segment chunk
+            # Append without overlap; batch until >= 400ms before yielding to client
             if audio_seg is not None and audio_seg.size > 0:
-                acc_pcm = _crossfade_concat(acc_pcm, audio_seg.astype(np.float32), sr_seg, 0)
-                if cancel_evt is None or not cancel_evt.is_set():
-                    yield (sr_seg, audio_seg.astype(np.float32)), transcript_acc
+                audio_seg = np.nan_to_num(audio_seg.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                acc_pcm = _crossfade_concat(acc_pcm, audio_seg, sr_seg, 0)
+                emit_buf_sa = np.concatenate([emit_buf_sa, audio_seg])
+                min_ms_sa = 400
+                if emit_buf_sa.size >= int(sr_seg * (min_ms_sa / 1000.0)):
+                    if cancel_evt is None or not cancel_evt.is_set():
+                        yield (sr_seg, emit_buf_sa), transcript_acc
+                    emit_buf_sa = np.array([], dtype=np.float32)
             return
 
         # Fallback: original delta-stream path for non-sentence-aware mode
         chat_ml = _build_chatml_for_text(st)
 
         q: pyqueue.Queue = pyqueue.Queue(maxsize=128)
+        # Buffer for gating small tails before emitting to client
+        emit_buf = np.array([], dtype=np.float32)
         async def producer():
             try:
                 async for delta in engine.generate_delta_stream(
@@ -652,9 +664,15 @@ def chat_stream_ollama_incremental_tts(
                         pcm = engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
                         new_tail = pcm[last_decoded_len:]
                         if new_tail.size > 0:
-                            acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, seg_overlap_ms)
-                            if cancel_evt is None or not cancel_evt.is_set():
-                                yield (sr, new_tail.astype(np.float32)), transcript_acc
+                            new_tail = np.nan_to_num(new_tail.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                            acc_pcm = _crossfade_concat(acc_pcm, new_tail, sr, seg_overlap_ms)
+                            # Gate: accumulate until we have >= min_chunk_ms
+                            emit_buf = np.concatenate([emit_buf, new_tail])
+                            min_ms = max(200, int(chunk_ms))
+                            if emit_buf.size >= int(sr * (min_ms / 1000.0)):
+                                if cancel_evt is None or not cancel_evt.is_set():
+                                    yield (sr, emit_buf), transcript_acc
+                                emit_buf = np.array([], dtype=np.float32)
                         last_decoded_len = pcm.shape[0]
                     except Exception:
                         pass
@@ -668,10 +686,16 @@ def chat_stream_ollama_incremental_tts(
                 if pcm.shape[0] > last_decoded_len:
                     new_tail = pcm[last_decoded_len:]
                     if new_tail.size > 0:
+                        new_tail = np.nan_to_num(new_tail.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
                         overlap_ms = 0 if sentence_aware_stream else seg_overlap_ms
-                        acc_pcm = _crossfade_concat(acc_pcm, new_tail.astype(np.float32), sr, overlap_ms)
-                        if cancel_evt is None or not cancel_evt.is_set():
-                            yield (sr, new_tail.astype(np.float32)), transcript_acc
+                        acc_pcm = _crossfade_concat(acc_pcm, new_tail, sr, overlap_ms)
+                        # Gate: accumulate until we have >= min_chunk_ms
+                        emit_buf = np.concatenate([emit_buf, new_tail])
+                        min_ms = max(200, int(chunk_ms))
+                        if emit_buf.size >= int(sr * (min_ms / 1000.0)):
+                            if cancel_evt is None or not cancel_evt.is_set():
+                                yield (sr, emit_buf), transcript_acc
+                            emit_buf = np.array([], dtype=np.float32)
             except Exception:
                 pass
 
@@ -713,8 +737,9 @@ def chat_stream_ollama_incremental_tts(
                     top_k=50,
                     max_new_tokens=1024,
                 )
-                # Emit the final audio once as a single chunk
-                yield (sr_full, audio_full.astype(np.float32)), final_text
+                # Emit the final audio once as a single chunk (sanitized)
+                audio_full = np.nan_to_num(audio_full.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                yield (sr_full, audio_full), final_text
         return
 
     for chunk in _ollama_stream_chat(ollama_model, user_text.strip(), cancel_evt, messages=msgs):
@@ -757,6 +782,12 @@ def chat_stream_ollama_incremental_tts(
             if tail:
                 yield from synth_and_stream(tail)
         if cancel_evt is None or not cancel_evt.is_set():
+            # Flush any remaining gated audio for non-sentence-aware path
+            if 'emit_buf' in locals() and emit_buf.size > 0:
+                yield (sr, emit_buf), transcript_acc
+            # Flush any remaining batched sentence-aware audio
+            if 'emit_buf_sa' in locals() and emit_buf_sa.size > 0:
+                yield (sr, emit_buf_sa), transcript_acc
             # Final text update only to avoid buffer replacement
             yield gr.update(), transcript_acc
 
